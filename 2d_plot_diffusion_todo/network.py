@@ -83,6 +83,14 @@ class SimpleNet(nn.Module):
 
         ######## TODO ########
         # DO NOT change the code outside this part.
+        self.l_in = TimeLinear(dim_in, dim_hids[0], num_timesteps)
+        self.relu = nn.ReLU()
+        layers = []
+        for i in range(0, len(dim_hids)-1):
+            layers.append(TimeLinear(dim_hids[i], dim_hids[i+1], num_timesteps))
+            layers.append(nn.ReLU())
+        self.hidden = nn.ModuleList(layers)
+        self.l_out = TimeLinear(dim_hids[-1], dim_out, num_timesteps)
 
         ######################
         
@@ -97,6 +105,13 @@ class SimpleNet(nn.Module):
         """
         ######## TODO ########
         # DO NOT change the code outside this part.
+        x = self.relu(self.l_in(x, t))
+        for layer in self.hidden:
+            if isinstance(layer, TimeLinear):
+                x = layer(x, t)
+            else:
+                x = layer(x)
+        x = self.l_out(x, t)
 
         ######################
         return x
