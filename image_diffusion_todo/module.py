@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
-
+from xformers.ops import memory_efficient_attention
 
 class Swish(nn.Module):
     def forward(self, x):
@@ -66,18 +66,18 @@ class AttnBlock(nn.Module):
         k = self.proj_k(h)
         v = self.proj_v(h)
 
-        q = q.permute(0, 2, 3, 1).view(B, H * W, C)
-        k = k.view(B, C, H * W)
-        w = torch.bmm(q, k) * (int(C) ** (-0.5))
-        assert list(w.shape) == [B, H * W, H * W]
-        w = F.softmax(w, dim=-1)
+        # reshape to (B, num_heads, seq_len, head_dim)
+        # here we treat the entire channel as one head for simplicity
+        q = q.view(B, C, H * W).permute(0, 2, 1).unsqueeze(1)  # (B, 1, HW, C)
+        k = k.view(B, C, H * W).permute(0, 2, 1).unsqueeze(1)  # (B, 1, HW, C)
+        v = v.view(B, C, H * W).permute(0, 2, 1).unsqueeze(1)  # (B, 1, HW, C)
 
-        v = v.permute(0, 2, 3, 1).view(B, H * W, C)
-        h = torch.bmm(w, v)
-        assert list(h.shape) == [B, H * W, C]
-        h = h.view(B, H, W, C).permute(0, 3, 1, 2)
+        # efficient attention
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0)  # (B, 1, HW, C)
+        # attn_out = memory_efficient_attention(q, k, v, attn_bias=None)
+
+        h = attn_out.squeeze(1).permute(0, 2, 1).view(B, C, H, W)
         h = self.proj(h)
-
         return x + h
 
 
@@ -127,17 +127,18 @@ class ResBlock(nn.Module):
 
 
 class TimeEmbedding(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    def __init__(self, hidden_size, frequency_embedding_size=256, dtype=torch.float32):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True, dtype=dtype),
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            nn.Linear(hidden_size, hidden_size, bias=True, dtype=dtype),
         )
         self.frequency_embedding_size = frequency_embedding_size
+        self.dtype = dtype
 
     @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
+    def timestep_embedding(t, dim, max_period=10000, dtype=torch.float32):
         """
         Create sinusoidal timestep embeddings.
         :param t: a 1-D Tensor of N indices, one per batch element.
@@ -150,10 +151,10 @@ class TimeEmbedding(nn.Module):
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period)
-            * torch.arange(start=0, end=half, dtype=torch.float32)
+            * torch.arange(start=0, end=half, dtype=dtype)
             / half
         ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
+        args = t[:, None].to(dtype) * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
             embedding = torch.cat(
@@ -164,6 +165,6 @@ class TimeEmbedding(nn.Module):
     def forward(self, t):
         if t.ndim == 0:
             t = t.unsqueeze(-1)
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size, dtype=self.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb

@@ -17,6 +17,9 @@ from tqdm import tqdm
 
 matplotlib.use("Agg")
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
 
 def get_current_time():
     now = datetime.now().strftime("%m-%d-%H%M%S")
@@ -28,6 +31,7 @@ def main(args):
     config = DotMap()
     config.update(vars(args))
     config.device = f"cuda:{args.gpu}"
+    # config.device = "cpu"
 
     now = get_current_time()
     if args.use_cfg:
@@ -51,9 +55,15 @@ def main(args):
         max_num_images_per_cat=config.max_num_images_per_cat,
         image_resolution=image_resolution
     )
+    # train_dtype = torch.bfloat16
+    train_dtype = torch.float32
 
     train_dl = ds_module.train_dataloader()
     train_it = get_data_iterator(train_dl)
+    if config.batch_overfit:
+        img, label = next(train_it)
+        img, label = img.to(config.device), label.to(config.device)
+        img = img.to(train_dtype, memory_format=torch.channels_last)
 
     # Set up the scheduler
     var_scheduler = DDPMScheduler(
@@ -61,6 +71,7 @@ def main(args):
         beta_1=config.beta_1,
         beta_T=config.beta_T,
         mode="linear",
+        # dtype=train_dtype
     )
 
     network = UNet(
@@ -74,12 +85,22 @@ def main(args):
         use_cfg=args.use_cfg,
         cfg_dropout=args.cfg_dropout,
         num_classes=getattr(ds_module, "num_classes", None),
+        dtype=train_dtype
+    )
+
+    network = network.to(dtype=train_dtype)
+    network = network.to(memory_format=torch.channels_last)
+
+    network = torch.compile(
+        network,
+        mode="reduce-overhead",
+        fullgraph=True
     )
 
     ddpm = DiffusionModule(network, var_scheduler)
     ddpm = ddpm.to(config.device)
 
-    optimizer = torch.optim.Adam(ddpm.network.parameters(), lr=2e-4)
+    optimizer = torch.optim.Adam(ddpm.network.parameters(), lr=2e-4, fused=True)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda t: min((t + 1) / config.warmup_steps, 1.0)
     )
@@ -88,7 +109,7 @@ def main(args):
     losses = []
     with tqdm(initial=step, total=config.train_num_steps) as pbar:
         while step < config.train_num_steps:
-            if step % config.log_interval == 0:
+            if step % config.log_interval == 0: #and step != 0:
                 ddpm.eval()
                 plt.plot(losses)
                 plt.savefig(f"{save_dir}/loss.png")
@@ -104,14 +125,16 @@ def main(args):
                     samples = ddpm.sample(4, return_traj=False)
 
                 pil_images = tensor_to_pil_image(samples)
-                for i, img in enumerate(pil_images):
-                    img.save(save_dir / f"step={step}-{i}.png")
+                for i, image in enumerate(pil_images):
+                    image.save(save_dir / f"step={step}-{i}.png")
 
                 ddpm.save(f"{save_dir}/last.ckpt")
                 ddpm.train()
 
-            img, label = next(train_it)
-            img, label = img.to(config.device), label.to(config.device)
+            if not config.batch_overfit:
+                img, label = next(train_it)
+                img, label = img.to(config.device), label.to(config.device)
+                img = img.to(train_dtype)
             if args.use_cfg:  # Conditional, CFG training
                 loss = ddpm.get_loss(img, class_label=label)
             else:  # Unconditional training
@@ -158,6 +181,7 @@ if __name__ == "__main__":
     parser.add_argument("--image_resolution", type=int, default=64)
     parser.add_argument("--sample_method", type=str, default="ddpm")
     parser.add_argument("--use_cfg", action="store_true")
+    parser.add_argument("--batch_overfit", action="store_true")
     parser.add_argument("--cfg_dropout", type=float, default=0.1)
     args = parser.parse_args()
     main(args)

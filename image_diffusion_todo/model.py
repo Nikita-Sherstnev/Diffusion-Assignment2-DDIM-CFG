@@ -19,6 +19,13 @@ class DiffusionModule(nn.Module):
         # compute noise matching loss.
         B = x0.shape[0]
         timestep = self.var_scheduler.uniform_sample_t(B, self.device)        
+        if noise is None:
+            noise = torch.randn_like(x0, dtype=x0.dtype)
+
+        x_t, noise = self.var_scheduler.add_noise(x0, timestep, noise)
+        x_t = x_t.to(x0.dtype)
+        x0 = (noise - self.network(x_t, timestep)).pow(2)
+
         loss = x0.mean()
         ######################
         return loss
@@ -56,7 +63,7 @@ class DiffusionModule(nn.Module):
 
         traj = [x_T]
         for t in tqdm(self.var_scheduler.timesteps):
-            x_t = traj[-1]
+            x_t = traj[-1].to(self.network.dtype)
             if do_classifier_free_guidance:
                 ######## TODO ########
                 # Assignment 2. Implement the classifier-free guidance.
@@ -90,7 +97,7 @@ class DiffusionModule(nn.Module):
         torch.save(dic, file_path)
 
     def load(self, file_path):
-        dic = torch.load(file_path, map_location="cpu")
+        dic = torch.load(file_path, map_location="cpu", weights_only=False)
         hparams = dic["hparams"]
         state_dict = dic["state_dict"]
 

@@ -5,9 +5,19 @@ import torch
 import torch.nn as nn
 
 
+def extract(input, t: torch.Tensor, x: torch.Tensor):
+    if t.ndim == 0:
+        t = t.unsqueeze(0)
+    shape = x.shape
+    t = t.long().to(input.device)
+    out = torch.gather(input, 0, t)
+    reshape = [t.shape[0]] + [1] * (len(shape) - 1)
+    return out.reshape(*reshape)
+
+
 class BaseScheduler(nn.Module):
     def __init__(
-        self, num_train_timesteps: int, beta_1: float, beta_T: float, mode="linear"
+        self, num_train_timesteps: int, beta_1: float, beta_T: float, mode="linear", dtype=torch.float32,
     ):
         super().__init__()
         self.num_train_timesteps = num_train_timesteps
@@ -28,12 +38,16 @@ class BaseScheduler(nn.Module):
         alphas = 1 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
 
+        betas = betas.to(dtype)
+        alphas = alphas.to(dtype)
+        alphas_cumprod = alphas_cumprod.to(dtype)
+
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alphas_cumprod", alphas_cumprod)
 
     def uniform_sample_t(
-        self, batch_size, device: Optional[torch.device] = None
+        self, batch_size, device: Optional[torch.device] = None,
     ) -> torch.IntTensor:
         """
         Uniformly sample timesteps.
@@ -52,8 +66,9 @@ class DDPMScheduler(BaseScheduler):
         beta_T: float,
         mode="linear",
         sigma_type="small",
+        dtype=torch.float32,
     ):
-        super().__init__(num_train_timesteps, beta_1, beta_T, mode)
+        super().__init__(num_train_timesteps, beta_1, beta_T, mode, dtype)
     
         # sigmas correspond to $\sigma_t$ in the DDPM paper.
         self.sigma_type = sigma_type
@@ -86,7 +101,21 @@ class DDPMScheduler(BaseScheduler):
         ######## TODO ########
         # DO NOT change the code outside this part.
         # Assignment 1. Implement the DDPM reverse step.
-        sample_prev = None
+        if isinstance(t, int):
+            t = torch.tensor([t]).to(self.device)
+        eps_factor = (1 - extract(self.alphas, t, x_t)) / (
+            1 - extract(self.alphas_cumprod, t, x_t)
+        ).sqrt()
+
+        if (t > 0).all():
+            z = torch.randn_like(x_t).to(x_t.device)
+        else:
+            z = torch.zeros_like(x_t).to(x_t.device)
+
+        a_t = extract(self.alphas, t, x_t)
+        beta_t = 1 - a_t
+        sigma_t = beta_t.sqrt()
+        sample_prev = (1 / a_t.sqrt()) * (x_t - eps_factor * eps_theta) + sigma_t * z
         #######################
         
         return sample_prev
@@ -115,12 +144,14 @@ class DDPMScheduler(BaseScheduler):
         """
         
         if eps is None:
-            eps       = torch.randn(x_0.shape, device='cuda')
+            eps       = torch.randn(x_0.shape, device='cuda', dtype=x_0.dtype)
 
         ######## TODO ########
         # DO NOT change the code outside this part.
         # Assignment 1. Implement the DDPM forward step.
-        x_t = None
+        alphas_prod_t = extract(self.alphas_cumprod, t, x_0)
+        x_t = torch.sqrt(alphas_prod_t) * x_0 + torch.sqrt(1 - alphas_prod_t) * eps
+
         #######################
 
         return x_t, eps
